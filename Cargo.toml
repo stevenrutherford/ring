@@ -319,6 +319,9 @@ wasm-bindgen-test = { version = "0.3.10", default-features = false }
 [target.'cfg(any(unix, windows))'.dev-dependencies]
 libc = { version = "0.2.69", default-features = false }
 
+[target.'cfg(all(any(target_arch = "x86", target_arch = "x86_64"), target_os = "none"))'.dependencies]
+getrandom = { version = "0.2.0", default-features = false, features = ["rdrand"] }
+
 # Keep this in sync with `[dependencies]` in pregenerate_asm/Cargo.toml.
 [build-dependencies]
 cc = { version = "1.0.52", default-features = false }
