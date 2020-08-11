@@ -194,6 +194,9 @@ use self::darwin::fill as fill_impl;
 #[cfg(any(target_os = "fuchsia"))]
 use self::fuchsia::fill as fill_impl;
 
+#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+use self::none::fill as fill_impl;
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 mod sysrand_chunk {
     use crate::{c, error};
@@ -427,5 +430,14 @@ mod fuchsia {
     #[link(name = "zircon")]
     extern "C" {
         fn zx_cprng_draw(buffer: *mut u8, length: usize);
+    }
+}
+
+#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+mod none {
+    use crate::error;
+
+    pub fn fill(dest: &mut [u8]) -> Result<(), error::Unspecified> {
+        getrandom::getrandom(dest).map_err(|_| error::Unspecified)
     }
 }
