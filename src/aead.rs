@@ -115,6 +115,36 @@ impl<N: NonceSequence> OpeningKey<N> {
     {
         self.open_within(aad, in_out, 0..)
     }
+    /// Authenticates and decrypts (“opens”) data.IOBuffer
+    ///
+    /// `aad` is the additional authenticated data (AAD), if any.
+    ///
+    /// On input, `input` must be the ciphertext followed by the tag.
+    ///
+    /// When `open()` returns `Err(..)`, `output` may have been
+    /// overwritten in an unspecified way.
+    ///
+    /// `open()` is the non-in-place equivalent of `open_in_place()`. Use of
+    /// `open()` requires caution, since the writes to the output occur before
+    /// verification.
+    #[inline]
+    pub fn open<'input, 'output, A>(
+        &mut self,
+        aad: Aad<A>,
+        input: &'input [u8],
+        output: &'output mut [u8],
+    ) -> Result<&'output mut [u8], error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        open_separate_(
+            &self.key,
+            self.nonce_sequence.advance()?,
+            aad,
+            input,
+            output,
+        )
+    }
 
     /// Authenticates and decrypts (“opens”) data in place, with a shift.
     ///
@@ -203,6 +233,26 @@ fn open_<'in_out>(
     Ok(())
 }
 
+fn open_separate_<'input, 'output, A: AsRef<[u8]>>(
+    key: &UnboundKey,
+    nonce: Nonce,
+    Aad(aad): Aad<A>,
+    input: &'input [u8],
+    output: &'output mut [u8],
+) -> Result<&'output mut [u8], error::Unspecified> {
+    let ciphertext_len = input.len().checked_sub(TAG_LEN).ok_or(error::Unspecified)?;
+    let (input, received_tag) = input.split_at(ciphertext_len);
+    let mut iobuffer = IOBuffer::new_separate(input, output)?;
+    open_(
+        key,
+        nonce,
+        Aad::from(aad.as_ref()),
+        iobuffer.borrow(),
+        received_tag,
+    )?;
+    Ok(&mut output[..ciphertext_len])
+}
+
 fn open_within_<'in_out, A: AsRef<[u8]>>(
     key: &UnboundKey,
     nonce: Nonce,
@@ -278,6 +328,26 @@ impl<N: NonceSequence> SealingKey<N> {
         self.seal_in_place_append_tag(aad, in_out)
     }
 
+    /// Encrypts and signs (“seals”) data
+    ///
+    /// `key.seal_append_tag()` is the non-in-place equivalent of
+    /// `key.seal_in_place_append_tag()`
+    #[inline]
+    pub fn seal_append_tag<A, In, Out>(
+        &mut self,
+        aad: Aad<A>,
+        input: &In,
+        output: &mut Out,
+    ) -> Result<(), error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+        In: AsRef<[u8]>,
+        Out: AsMut<[u8]> + for<'in_out> Extend<&'in_out u8>,
+    {
+        self.seal_separate_tag(aad, input.as_ref(), output.as_mut())
+            .map(|tag| output.extend(tag.as_ref()))
+    }
+
     /// Encrypts and signs (“seals”) data in place, appending the tag to the
     /// resulting ciphertext.
     ///
@@ -299,6 +369,29 @@ impl<N: NonceSequence> SealingKey<N> {
     {
         self.seal_in_place_separate_tag(aad, in_out.as_mut())
             .map(|tag| in_out.extend(tag.as_ref()))
+    }
+
+    /// Encrypts and signs (“seals”) data.
+    ///
+    /// `key.seal_separate_tag()` is the non-in-place equivalent of
+    /// `key.seal_in_place_separate_tag()`
+    #[inline]
+    pub fn seal_separate_tag<A>(
+        &mut self,
+        aad: Aad<A>,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<Tag, error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        seal_separate_tag_(
+            &self.key,
+            self.nonce_sequence.advance()?,
+            Aad::from(aad.as_ref()),
+            input,
+            output,
+        )
     }
 
     /// Encrypts and signs (“seals”) data in place.
@@ -328,6 +421,25 @@ impl<N: NonceSequence> SealingKey<N> {
             in_out,
         )
     }
+}
+
+#[inline]
+fn seal_separate_tag_(
+    key: &UnboundKey,
+    nonce: Nonce,
+    aad: Aad<&[u8]>,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<Tag, error::Unspecified> {
+    check_per_nonce_max_bytes(key.algorithm, input.len())?;
+    let iobuffer = IOBuffer::new_separate(input, output)?;
+    Ok((key.algorithm.seal)(
+        &key.inner,
+        nonce,
+        aad,
+        iobuffer,
+        key.cpu_features,
+    ))
 }
 
 #[inline]
@@ -699,7 +811,7 @@ impl<'in_out> IOBuffer<'in_out> {
             in_prefix_len,
         })
     }
-    fn _new_separate(
+    fn new_separate(
         input: &'in_out [u8],
         output: &'in_out mut [u8],
     ) -> Result<IOBuffer<'in_out>, error::Unspecified> {
@@ -795,7 +907,7 @@ mod tests {
     fn test_separate_buffer() {
         let input = [0, 1, 2];
         let mut output = [0, 1, 2];
-        let mut split = IOBuffer::_new_separate(&input, &mut output).unwrap();
+        let mut split = IOBuffer::new_separate(&input, &mut output).unwrap();
         assert_eq!(split.borrow().index_to(..2).input(), [0, 1]);
         assert_eq!(split.borrow().index_to(..2).output(), [0, 1]);
         assert_eq!(split.borrow().index_from(1..).input(), [1, 2]);
