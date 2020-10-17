@@ -14,7 +14,7 @@
 
 use super::{
     aes::{self, Counter},
-    gcm, shift, Aad, Block, Direction, Nonce, Tag, BLOCK_LEN,
+    gcm, shift, Aad, Block, Direction, IOBuffer, Nonce, Tag, BLOCK_LEN,
 };
 use crate::{aead, cpu, endian::*, error, polyfill};
 
@@ -62,12 +62,11 @@ fn init(
 }
 
 const CHUNK_BLOCKS: usize = 3 * 1024 / 16;
-
 fn aes_gcm_seal(
     key: &aead::KeyInner,
     nonce: Nonce,
     aad: Aad<&[u8]>,
-    in_out: &mut [u8],
+    in_out: IOBuffer<'_>,
     cpu_features: cpu::Features,
 ) -> Tag {
     aead(key, nonce, aad, in_out, Direction::Sealing, cpu_features)
@@ -77,18 +76,10 @@ fn aes_gcm_open(
     key: &aead::KeyInner,
     nonce: Nonce,
     aad: Aad<&[u8]>,
-    in_prefix_len: usize,
-    in_out: &mut [u8],
+    in_out: IOBuffer<'_>,
     cpu_features: cpu::Features,
 ) -> Tag {
-    aead(
-        key,
-        nonce,
-        aad,
-        in_out,
-        Direction::Opening { in_prefix_len },
-        cpu_features,
-    )
+    aead(key, nonce, aad, in_out, Direction::Opening, cpu_features)
 }
 
 #[inline(always)] // Avoid branching on `direction`.
@@ -96,7 +87,7 @@ fn aead(
     key: &aead::KeyInner,
     nonce: Nonce,
     aad: Aad<&[u8]>,
-    in_out: &mut [u8],
+    in_out: IOBuffer<'_>,
     direction: Direction,
     cpu_features: cpu::Features,
 ) -> Tag {
@@ -111,14 +102,8 @@ fn aead(
     let aad_len = aad.0.len();
     let mut gcm_ctx = gcm::Context::new(gcm_key, aad, cpu_features);
 
-    let in_prefix_len = match direction {
-        Direction::Opening { in_prefix_len } => in_prefix_len,
-        Direction::Sealing => 0,
-    };
-
-    let total_in_out_len = in_out.len() - in_prefix_len;
-
-    let in_out = integrated_aes_gcm(
+    let total_in_out_len = in_out.len();
+    let mut in_out = integrated_aes_gcm(
         aes_key,
         &mut gcm_ctx,
         in_out,
@@ -126,47 +111,44 @@ fn aead(
         direction,
         cpu_features,
     );
-    let in_out_len = in_out.len() - in_prefix_len;
+    let in_out_len = in_out.len();
 
     // Process any (remaining) whole blocks.
     let whole_len = in_out_len - (in_out_len % BLOCK_LEN);
     {
         let mut chunk_len = CHUNK_BLOCKS * BLOCK_LEN;
-        let mut output = 0;
-        let mut input = in_prefix_len;
+        let mut index = 0;
         loop {
-            if whole_len - output < chunk_len {
-                chunk_len = whole_len - output;
+            if whole_len - index < chunk_len {
+                chunk_len = whole_len - index;
             }
             if chunk_len == 0 {
                 break;
             }
 
-            if let Direction::Opening { .. } = direction {
-                gcm_ctx.update_blocks(&in_out[input..][..chunk_len]);
+            if let Direction::Opening = direction {
+                gcm_ctx.update_blocks(&in_out.input()[index..][..chunk_len]);
             }
 
             aes_key.ctr32_encrypt_blocks(
-                &mut in_out[output..][..(chunk_len + in_prefix_len)],
-                direction,
+                &mut in_out.borrow().index_from(index..).index_to(..(chunk_len)),
                 &mut ctr,
             );
 
             if let Direction::Sealing = direction {
-                gcm_ctx.update_blocks(&in_out[output..][..chunk_len]);
+                gcm_ctx.update_blocks(&in_out.output()[index..][..chunk_len]);
             }
 
-            output += chunk_len;
-            input += chunk_len;
+            index += chunk_len;
         }
     }
 
     // Process any remaining partial block.
-    let remainder = &mut in_out[whole_len..];
-    shift::shift_partial((in_prefix_len, remainder), |remainder| {
+    let remainder = in_out.borrow().index_from(whole_len..);
+    shift::shift_partial(remainder, |remainder| {
         let mut input = Block::zero();
         input.overwrite_part_at(0, remainder);
-        if let Direction::Opening { .. } = direction {
+        if let Direction::Opening = direction {
             gcm_ctx.update_block(input);
         }
         let mut output = aes_key.encrypt_iv_xor_block(ctr.into(), input);
@@ -197,22 +179,21 @@ fn aead(
 // Returns the data that wasn't processed.
 #[cfg(target_arch = "x86_64")]
 #[inline] // Optimize out the match on `direction`.
-fn integrated_aes_gcm<'a>(
+fn integrated_aes_gcm<'in_out>(
     aes_key: &aes::Key,
     gcm_ctx: &mut gcm::Context,
-    in_out: &'a mut [u8],
+    mut in_out: IOBuffer<'in_out>,
     ctr: &mut Counter,
     direction: Direction,
     cpu_features: cpu::Features,
-) -> &'a mut [u8] {
+) -> IOBuffer<'in_out> {
     use crate::c;
 
     if !aes_key.is_aes_hw() || !gcm_ctx.is_avx2(cpu_features) {
         return in_out;
     }
-
     let processed = match direction {
-        Direction::Opening { in_prefix_len } => {
+        Direction::Opening => {
             extern "C" {
                 fn GFp_aesni_gcm_decrypt(
                     input: *const u8,
@@ -225,9 +206,9 @@ fn integrated_aes_gcm<'a>(
             }
             unsafe {
                 GFp_aesni_gcm_decrypt(
-                    in_out[in_prefix_len..].as_ptr(),
-                    in_out.as_mut_ptr(),
-                    in_out.len() - in_prefix_len,
+                    in_out.input().as_ptr(),
+                    in_out.output().as_mut_ptr(),
+                    in_out.len(),
                     aes_key.inner_less_safe(),
                     ctr,
                     gcm_ctx.inner(),
@@ -247,8 +228,8 @@ fn integrated_aes_gcm<'a>(
             }
             unsafe {
                 GFp_aesni_gcm_encrypt(
-                    in_out.as_ptr(),
-                    in_out.as_mut_ptr(),
+                    in_out.input().as_ptr(),
+                    in_out.output().as_mut_ptr(),
                     in_out.len(),
                     aes_key.inner_less_safe(),
                     ctr,
@@ -258,19 +239,19 @@ fn integrated_aes_gcm<'a>(
         }
     };
 
-    &mut in_out[processed..]
+    in_out.index_from(processed..)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
-fn integrated_aes_gcm<'a>(
-    _: &aes::Key,
-    _: &mut gcm::Context,
-    in_out: &'a mut [u8],
-    _: &mut Counter,
-    _: Direction,
-    _: cpu::Features,
-) -> &'a mut [u8] {
+fn integrated_aes_gcm<'in_out>(
+    aes_key: &aes::Key,
+    gcm_ctx: &mut gcm::Context,
+    mut in_out: IOBuffer<'in_out>,
+    ctr: &mut Counter,
+    direction: Direction,
+    cpu_features: cpu::Features,
+) -> IOBuffer<'in_out> {
     in_out // This doesn't process any of the input so it all remains.
 }
 

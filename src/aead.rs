@@ -23,7 +23,7 @@
 
 use self::block::{Block, BLOCK_LEN};
 use crate::{constant_time, cpu, error, hkdf, polyfill};
-use core::ops::RangeFrom;
+use core::ops::{RangeFrom, RangeTo};
 
 pub use self::{
     aes_gcm::{AES_128_GCM, AES_256_GCM},
@@ -179,7 +179,30 @@ impl<N: NonceSequence> OpeningKey<N> {
     }
 }
 
-#[inline]
+fn open_<'in_out>(
+    key: &UnboundKey,
+    nonce: Nonce,
+    aad: Aad<&[u8]>,
+    mut in_out: IOBuffer<'in_out>,
+    received_tag: &[u8],
+) -> Result<(), error::Unspecified> {
+    check_per_nonce_max_bytes(key.algorithm, in_out.len())?;
+    let Tag(calculated_tag) =
+        (key.algorithm.open)(&key.inner, nonce, aad, in_out.borrow(), key.cpu_features);
+    if constant_time::verify_slices_are_equal(calculated_tag.as_ref(), received_tag).is_err() {
+        // Zero out the plaintext so that it isn't accidentally leaked or used
+        // after verification fails. It would be safest if we could check the
+        // tag before decrypting, but some `open` implementations interleave
+        // authentication with decryption for performance.
+        let mut in_out = in_out.borrow();
+        for b in &mut in_out.output().iter_mut() {
+            *b = 0;
+        }
+        return Err(error::Unspecified);
+    }
+    Ok(())
+}
+
 fn open_within_<'in_out, A: AsRef<[u8]>>(
     key: &UnboundKey,
     nonce: Nonce,
@@ -187,52 +210,24 @@ fn open_within_<'in_out, A: AsRef<[u8]>>(
     in_out: &'in_out mut [u8],
     ciphertext_and_tag: RangeFrom<usize>,
 ) -> Result<&'in_out mut [u8], error::Unspecified> {
-    fn open_within<'in_out>(
-        key: &UnboundKey,
-        nonce: Nonce,
-        aad: Aad<&[u8]>,
-        in_out: &'in_out mut [u8],
-        ciphertext_and_tag: RangeFrom<usize>,
-    ) -> Result<&'in_out mut [u8], error::Unspecified> {
-        let in_prefix_len = ciphertext_and_tag.start;
-        let ciphertext_and_tag_len = in_out
-            .len()
-            .checked_sub(in_prefix_len)
-            .ok_or(error::Unspecified)?;
-        let ciphertext_len = ciphertext_and_tag_len
-            .checked_sub(TAG_LEN)
-            .ok_or(error::Unspecified)?;
-        check_per_nonce_max_bytes(key.algorithm, ciphertext_len)?;
-        let (in_out, received_tag) = in_out.split_at_mut(in_prefix_len + ciphertext_len);
-        let Tag(calculated_tag) = (key.algorithm.open)(
-            &key.inner,
-            nonce,
-            aad,
-            in_prefix_len,
-            in_out,
-            key.cpu_features,
-        );
-        if constant_time::verify_slices_are_equal(calculated_tag.as_ref(), received_tag).is_err() {
-            // Zero out the plaintext so that it isn't accidentally leaked or used
-            // after verification fails. It would be safest if we could check the
-            // tag before decrypting, but some `open` implementations interleave
-            // authentication with decryption for performance.
-            for b in &mut in_out[..ciphertext_len] {
-                *b = 0;
-            }
-            return Err(error::Unspecified);
-        }
-        // `ciphertext_len` is also the plaintext length.
-        Ok(&mut in_out[..ciphertext_len])
-    }
-
-    open_within(
+    let in_prefix_len = ciphertext_and_tag.start;
+    let ciphertext_and_tag_len = in_out
+        .len()
+        .checked_sub(in_prefix_len)
+        .ok_or(error::Unspecified)?;
+    let ciphertext_len = ciphertext_and_tag_len
+        .checked_sub(TAG_LEN)
+        .ok_or(error::Unspecified)?;
+    let (in_out, received_tag) = in_out.split_at_mut(in_prefix_len + ciphertext_len);
+    let mut iobuffer = IOBuffer::new_in_place_offset(in_out, in_prefix_len)?;
+    open_(
         key,
         nonce,
         Aad::from(aad.as_ref()),
-        in_out,
-        ciphertext_and_tag,
-    )
+        iobuffer.borrow(),
+        received_tag,
+    )?;
+    Ok(&mut in_out[..ciphertext_len])
 }
 
 /// An AEAD key for encrypting and signing ("sealing"), bound to a nonce
@@ -343,11 +338,12 @@ fn seal_in_place_separate_tag_(
     in_out: &mut [u8],
 ) -> Result<Tag, error::Unspecified> {
     check_per_nonce_max_bytes(key.algorithm, in_out.len())?;
+    let iobuffer = IOBuffer::new_in_place(in_out);
     Ok((key.algorithm.seal)(
         &key.inner,
         nonce,
         aad,
-        in_out,
+        iobuffer,
         key.cpu_features,
     ))
 }
@@ -566,15 +562,14 @@ pub struct Algorithm {
         key: &KeyInner,
         nonce: Nonce,
         aad: Aad<&[u8]>,
-        in_out: &mut [u8],
+        in_out: IOBuffer<'_>,
         cpu_features: cpu::Features,
     ) -> Tag,
     open: fn(
         key: &KeyInner,
         nonce: Nonce,
         aad: Aad<&[u8]>,
-        in_prefix_len: usize,
-        in_out: &mut [u8],
+        in_out: IOBuffer<'_>,
         cpu_features: cpu::Features,
     ) -> Tag,
 
@@ -660,8 +655,154 @@ fn check_per_nonce_max_bytes(alg: &Algorithm, in_out_len: usize) -> Result<(), e
 
 #[derive(Clone, Copy)]
 enum Direction {
-    Opening { in_prefix_len: usize },
+    Opening,
     Sealing,
+}
+
+// TODO: ideally this would not need to be public, but chacha's encrypt, and
+// shift_partial leak this type.
+/// IOBuffer is an abstraction for Input/Output buffers used in AEAD.
+#[derive(Debug)]
+pub enum IOBuffer<'in_out> {
+    /// InPlace is the wrapper for a mutable in_out buffer and an in_prefix_len.
+    InPlace {
+        /// In/Out Buffer for AEAD.
+        in_out: &'in_out mut [u8],
+        /// Length of prefix before the ciphertext. See `open_within` for more.
+        in_prefix_len: usize,
+    },
+    /// Separate is the wrapper for an input buffer and a mutable output buffer.
+    Separate {
+        /// Input buffer for AEAD.
+        input: &'in_out [u8],
+        /// Output buffer for AEAD.
+        output: &'in_out mut [u8],
+    },
+}
+
+impl<'in_out> IOBuffer<'in_out> {
+    fn new_in_place(in_out: &'in_out mut [u8]) -> IOBuffer {
+        IOBuffer::InPlace {
+            in_out,
+            in_prefix_len: 0,
+        }
+    }
+    fn new_in_place_offset(
+        in_out: &'in_out mut [u8],
+        in_prefix_len: usize,
+    ) -> Result<IOBuffer, error::Unspecified> {
+        if in_out.len() < in_prefix_len {
+            return Err(error::Unspecified);
+        }
+        Ok(IOBuffer::InPlace {
+            in_out,
+            in_prefix_len,
+        })
+    }
+    fn _new_separate(
+        input: &'in_out [u8],
+        output: &'in_out mut [u8],
+    ) -> Result<IOBuffer<'in_out>, error::Unspecified> {
+        if input.len() != output.len() {
+            return Err(error::Unspecified);
+        }
+        Ok(IOBuffer::Separate { input, output })
+    }
+
+    #[inline]
+    fn input(&self) -> &[u8] {
+        match self {
+            IOBuffer::InPlace {
+                in_out,
+                in_prefix_len,
+            } => &in_out[*in_prefix_len..],
+            IOBuffer::Separate { input, output: _ } => input,
+        }
+    }
+    #[inline]
+    fn output(&mut self) -> &mut [u8] {
+        match self {
+            IOBuffer::InPlace {
+                in_out,
+                in_prefix_len: _,
+            } => *in_out,
+            IOBuffer::Separate { input: _, output } => *output,
+        }
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            IOBuffer::InPlace {
+                in_out,
+                in_prefix_len,
+            } => in_out.len() - in_prefix_len,
+            IOBuffer::Separate { input: _, output } => output.len(),
+        }
+    }
+    #[inline]
+    fn borrow<'buf>(&'buf mut self) -> IOBuffer<'buf> {
+        match self {
+            IOBuffer::InPlace {
+                in_out,
+                in_prefix_len,
+            } => IOBuffer::InPlace {
+                in_out,
+                in_prefix_len: *in_prefix_len,
+            },
+            IOBuffer::Separate { input, output } => IOBuffer::Separate { input, output },
+        }
+    }
+    #[inline]
+    fn index_to(self, idx: RangeTo<usize>) -> IOBuffer<'in_out> {
+        match self {
+            IOBuffer::InPlace {
+                in_out,
+                in_prefix_len,
+            } => IOBuffer::InPlace {
+                // Need to ensure that the in_out buffer spans the full width
+                // from start of input to end of output.
+                in_out: &mut in_out[..idx.end + in_prefix_len],
+                in_prefix_len,
+            },
+            IOBuffer::Separate { input, output } => IOBuffer::Separate {
+                input: &input[idx.clone()],
+                output: &mut output[idx],
+            },
+        }
+    }
+    #[inline]
+    fn index_from(self, idx: RangeFrom<usize>) -> IOBuffer<'in_out> {
+        match self {
+            IOBuffer::InPlace {
+                in_out,
+                in_prefix_len,
+            } => IOBuffer::InPlace {
+                in_out: &mut in_out[idx],
+                in_prefix_len,
+            },
+            IOBuffer::Separate { input, output } => IOBuffer::Separate {
+                input: &input[idx.clone()],
+                output: &mut output[idx],
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_separate_buffer() {
+        let input = [0, 1, 2];
+        let mut output = [0, 1, 2];
+        let mut split = IOBuffer::_new_separate(&input, &mut output).unwrap();
+        assert_eq!(split.borrow().index_to(..2).input(), [0, 1]);
+        assert_eq!(split.borrow().index_to(..2).output(), [0, 1]);
+        assert_eq!(split.borrow().index_from(1..).input(), [1, 2]);
+        assert_eq!(split.borrow().index_from(1..).output(), [1, 2]);
+        assert_eq!(split.borrow().index_to(..2).index_from(1..).input(), [1]);
+        assert_eq!(split.borrow().index_to(..2).index_from(1..).output(), [1]);
+    }
 }
 
 mod aes;

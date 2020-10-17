@@ -12,7 +12,10 @@
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-use super::block::{Block, BLOCK_LEN};
+use super::{
+    block::{Block, BLOCK_LEN},
+    IOBuffer,
+};
 
 #[cfg(target_arch = "x86")]
 pub fn shift_full_blocks<F>(in_out: &mut [u8], in_prefix_len: usize, mut transform: F)
@@ -34,12 +37,12 @@ where
     }
 }
 
-pub fn shift_partial<F>((in_prefix_len, in_out): (usize, &mut [u8]), transform: F)
+pub fn shift_partial<F>(mut in_out: IOBuffer, transform: F)
 where
     F: FnOnce(&[u8]) -> Block,
 {
     let (block, in_out_len) = {
-        let input = &in_out[in_prefix_len..];
+        let input = &in_out.input();
         let in_out_len = input.len();
         if in_out_len == 0 {
             return;
@@ -47,5 +50,5 @@ where
         debug_assert!(in_out_len < BLOCK_LEN);
         (transform(input), in_out_len)
     };
-    in_out[..in_out_len].copy_from_slice(&block.as_ref()[..in_out_len]);
+    in_out.output()[..in_out_len].copy_from_slice(&block.as_ref()[..in_out_len]);
 }

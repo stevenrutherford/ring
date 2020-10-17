@@ -15,7 +15,7 @@
 use super::{
     chacha::{self, Counter},
     iv::Iv,
-    poly1305, Aad, Block, Direction, Nonce, Tag, BLOCK_LEN,
+    poly1305, Aad, Block, Direction, IOBuffer, Nonce, Tag, BLOCK_LEN,
 };
 use crate::{aead, cpu, endian::*, error, polyfill};
 use core::convert::TryInto;
@@ -47,7 +47,7 @@ fn chacha20_poly1305_seal(
     key: &aead::KeyInner,
     nonce: Nonce,
     aad: Aad<&[u8]>,
-    in_out: &mut [u8],
+    in_out: IOBuffer<'_>,
     cpu_features: cpu::Features,
 ) -> Tag {
     aead(key, nonce, aad, in_out, Direction::Sealing, cpu_features)
@@ -57,18 +57,10 @@ fn chacha20_poly1305_open(
     key: &aead::KeyInner,
     nonce: Nonce,
     aad: Aad<&[u8]>,
-    in_prefix_len: usize,
-    in_out: &mut [u8],
+    in_out: IOBuffer<'_>,
     cpu_features: cpu::Features,
 ) -> Tag {
-    aead(
-        key,
-        nonce,
-        aad,
-        in_out,
-        Direction::Opening { in_prefix_len },
-        cpu_features,
-    )
+    aead(key, nonce, aad, in_out, Direction::Opening, cpu_features)
 }
 
 pub type Key = chacha::Key;
@@ -78,7 +70,7 @@ fn aead(
     key: &aead::KeyInner,
     nonce: Nonce,
     Aad(aad): Aad<&[u8]>,
-    in_out: &mut [u8],
+    mut in_out: IOBuffer,
     direction: Direction,
     _todo: cpu::Features,
 ) -> Tag {
@@ -96,14 +88,23 @@ fn aead(
     poly1305_update_padded_16(&mut ctx, aad);
 
     let in_out_len = match direction {
-        Direction::Opening { in_prefix_len } => {
-            poly1305_update_padded_16(&mut ctx, &in_out[in_prefix_len..]);
-            chacha20_key.encrypt_overlapping(counter, in_out, in_prefix_len);
-            in_out.len() - in_prefix_len
+        Direction::Opening => {
+            poly1305_update_padded_16(&mut ctx, &in_out.input());
+            match in_out.borrow() {
+                IOBuffer::InPlace {
+                    in_out,
+                    in_prefix_len,
+                } => chacha20_key.encrypt_overlapping(counter, in_out, in_prefix_len),
+                IOBuffer::Separate {
+                    input: _,
+                    output: _,
+                } => chacha20_key.encrypt(counter, in_out.borrow()),
+            }
+            in_out.len()
         }
         Direction::Sealing => {
-            chacha20_key.encrypt_in_place(counter, in_out);
-            poly1305_update_padded_16(&mut ctx, in_out);
+            chacha20_key.encrypt(counter, in_out.borrow());
+            poly1305_update_padded_16(&mut ctx, in_out.output());
             in_out.len()
         }
     };

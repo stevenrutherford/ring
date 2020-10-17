@@ -12,7 +12,7 @@
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-use super::{counter, iv::Iv, quic::Sample, Block, Direction, BLOCK_LEN};
+use super::{counter, iv::Iv, quic::Sample, Block, IOBuffer, BLOCK_LEN};
 use crate::{bits::BitLength, c, cpu, endian::*, error, polyfill};
 
 pub(crate) struct Key {
@@ -77,7 +77,7 @@ macro_rules! ctr32_encrypt_blocks {
                 ivec: &Counter,
             );
         }
-        ctr32_encrypt_blocks_($name, $in_out, $in_prefix_len, $key, $ivec)
+        ctr32_encrypt_blocks_($name, $in_out, $key, $ivec)
     }};
 }
 
@@ -90,20 +90,19 @@ fn ctr32_encrypt_blocks_(
         key: &AES_KEY,
         ivec: &Counter,
     ),
-    in_out: &mut [u8],
-    in_prefix_len: usize,
+    in_out: &mut IOBuffer,
     key: &AES_KEY,
     ctr: &mut Counter,
 ) {
-    let in_out_len = in_out.len().checked_sub(in_prefix_len).unwrap();
+    let in_out_len = in_out.len();
     assert_eq!(in_out_len % BLOCK_LEN, 0);
 
     let blocks = in_out_len / BLOCK_LEN;
     let blocks_u32 = blocks as u32;
     assert_eq!(blocks, polyfill::usize_from_u32(blocks_u32));
 
-    let input = in_out[in_prefix_len..].as_ptr();
-    let output = in_out.as_mut_ptr();
+    let input = in_out.input().as_ptr();
+    let output = in_out.output().as_mut_ptr();
 
     unsafe {
         f(input, output, blocks, &key, ctr);
@@ -196,18 +195,8 @@ impl Key {
     }
 
     #[inline]
-    pub(super) fn ctr32_encrypt_blocks(
-        &self,
-        in_out: &mut [u8],
-        direction: Direction,
-        ctr: &mut Counter,
-    ) {
-        let in_prefix_len = match direction {
-            Direction::Opening { in_prefix_len } => in_prefix_len,
-            Direction::Sealing => 0,
-        };
-
-        let in_out_len = in_out.len().checked_sub(in_prefix_len).unwrap();
+    pub(super) fn ctr32_encrypt_blocks(&self, in_out: &mut IOBuffer, ctr: &mut Counter) {
+        let in_out_len = in_out.len();
 
         assert_eq!(in_out_len % BLOCK_LEN, 0);
 

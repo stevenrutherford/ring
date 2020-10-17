@@ -13,7 +13,7 @@
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-use super::{counter, iv::Iv, quic::Sample, BLOCK_LEN};
+use super::{counter, iv::Iv, quic::Sample, IOBuffer, BLOCK_LEN};
 use crate::{c, endian::*};
 
 #[repr(C)]
@@ -28,21 +28,26 @@ impl From<[u8; KEY_LEN]> for Key {
 
 impl Key {
     #[inline] // Optimize away match on `counter`.
-    pub fn encrypt_in_place(&self, counter: Counter, in_out: &mut [u8]) {
+    pub fn encrypt(&self, counter: Counter, mut in_out: IOBuffer) {
         unsafe {
-            self.encrypt(
+            self.encrypt_(
                 CounterOrIv::Counter(counter),
-                in_out.as_ptr(),
+                in_out.input().as_ptr(),
                 in_out.len(),
-                in_out.as_mut_ptr(),
+                in_out.output().as_mut_ptr(),
             );
         }
+    }
+
+    #[inline]
+    pub fn encrypt_in_place(&self, counter: Counter, in_out: &mut [u8]) {
+        self.encrypt(counter, IOBuffer::new_in_place(in_out))
     }
 
     #[inline] // Optimize away match on `iv` and length check.
     pub fn encrypt_iv_xor_blocks_in_place(&self, iv: Iv, in_out: &mut [u8; 2 * BLOCK_LEN]) {
         unsafe {
-            self.encrypt(
+            self.encrypt_(
                 CounterOrIv::Iv(iv),
                 in_out.as_ptr(),
                 in_out.len(),
@@ -57,7 +62,7 @@ impl Key {
         let iv = Iv::assume_unique_for_key(sample);
 
         unsafe {
-            self.encrypt(
+            self.encrypt_(
                 CounterOrIv::Iv(iv),
                 out.as_ptr(),
                 out.len(),
@@ -81,7 +86,7 @@ impl Key {
             self.encrypt_in_place(counter, &mut in_out[..len]);
         } else {
             unsafe {
-                self.encrypt(
+                self.encrypt_(
                     CounterOrIv::Counter(counter),
                     in_out[in_prefix_len..].as_ptr(),
                     len,
@@ -92,7 +97,7 @@ impl Key {
     }
 
     #[inline] // Optimize away match on `counter.`
-    unsafe fn encrypt(
+    unsafe fn encrypt_(
         &self,
         counter: CounterOrIv,
         input: *const u8,
@@ -198,7 +203,7 @@ mod tests {
         // Straightforward encryption into disjoint buffers is computed
         // correctly.
         unsafe {
-            key.encrypt(
+            key.encrypt_(
                 CounterOrIv::Counter(Counter::from_test_vector(nonce, ctr)),
                 input[..len].as_ptr(),
                 len,
