@@ -582,6 +582,23 @@ impl LessSafeKey {
         self.open_within(nonce, aad, in_out, 0..)
     }
 
+    /// Like [`OpeningKey::open_in_place()`], except it accepts an arbitrary nonce.
+    ///
+    /// `nonce` must be unique for every use of the key to open data.
+    #[inline]
+    pub fn open<'output, A>(
+        &self,
+        nonce: Nonce,
+        aad: Aad<A>,
+        input: &[u8],
+        output: &'output mut [u8],
+    ) -> Result<&'output mut [u8], error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        open_separate_(&self.key, nonce, aad, input, output)
+    }
+
     /// Like [`OpeningKey::open_within()`], except it accepts an arbitrary nonce.
     ///
     /// `nonce` must be unique for every use of the key to open data.
@@ -649,6 +666,56 @@ impl LessSafeKey {
         A: AsRef<[u8]>,
     {
         seal_in_place_separate_tag_(&self.key, nonce, Aad::from(aad.as_ref()), in_out)
+    }
+
+    /// Like [`SealingKey::seal_append_tag()`], except it accepts an
+    /// arbitrary nonce.
+    ///
+    /// `nonce` must be unique for every use of the key to seal data.
+    #[inline]
+    pub fn seal_append_tag<A, Output>(
+        &self,
+        nonce: Nonce,
+        aad: Aad<A>,
+        input: &[u8],
+        output: &mut Output,
+    ) -> Result<(), error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+        Output: AsMut<[u8]> + for<'in_out> Extend<&'in_out u8>,
+    {
+        seal_separate_tag_(
+            &self.key,
+            nonce,
+            Aad::from(aad.as_ref()),
+            input,
+            output.as_mut(),
+        )
+        .map(|tag| output.extend(tag.as_ref()))
+    }
+
+    /// Like `SealingKey::seal_separate_tag()`, except it accepts an
+    /// arbitrary nonce.
+    ///
+    /// `nonce` must be unique for every use of the key to seal data.
+    #[inline]
+    pub fn seal_separate_tag<A>(
+        &self,
+        nonce: Nonce,
+        aad: Aad<A>,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<Tag, error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        seal_separate_tag_(
+            &self.key,
+            nonce,
+            Aad::from(aad.as_ref()),
+            input,
+            output.as_mut(),
+        )
     }
 
     /// The key's AEAD algorithm.
