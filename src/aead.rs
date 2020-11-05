@@ -146,6 +146,37 @@ impl<N: NonceSequence> OpeningKey<N> {
         )
     }
 
+    /// Authenticates and decrypts (“opens”) data.IOBuffer
+    ///
+    /// `aad` is the additional authenticated data (AAD), if any.
+    ///
+    /// When `open_separate_tag()` returns `Err(..)`, `output` may have
+    /// been overwritten in an unspecified way.
+    ///
+    /// `open_separate_tag()` is the equivalent of `open()` with a
+    /// separate tag. Use of `open_separate_tag()` requires caution,
+    /// since the writes to the output occur before verification.
+    #[inline]
+    pub fn open_separate_tag<'input, 'output, A>(
+        &mut self,
+        aad: Aad<A>,
+        input: &'input [u8],
+        output: &'output mut [u8],
+        tag: &'input [u8],
+    ) -> Result<&'output mut [u8], error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        open_separate_with_separate_tag_(
+            &self.key,
+            self.nonce_sequence.advance()?,
+            aad,
+            input,
+            output,
+            tag,
+        )
+    }
+
     /// Authenticates and decrypts (“opens”) data in place, with a shift.
     ///
     /// `aad` is the additional authenticated data (AAD), if any.
@@ -251,6 +282,19 @@ fn open_separate_<'input, 'output, A: AsRef<[u8]>>(
         received_tag,
     )?;
     Ok(&mut output[..ciphertext_len])
+}
+
+fn open_separate_with_separate_tag_<'input, 'output, A: AsRef<[u8]>>(
+    key: &UnboundKey,
+    nonce: Nonce,
+    Aad(aad): Aad<A>,
+    input: &'input [u8],
+    output: &'output mut [u8],
+    tag: &'input [u8],
+) -> Result<&'output mut [u8], error::Unspecified> {
+    let mut iobuffer = IOBuffer::new_separate(input, output)?;
+    open_(key, nonce, Aad::from(aad.as_ref()), iobuffer.borrow(), tag)?;
+    Ok(&mut output[..input.len()])
 }
 
 fn open_within_<'in_out, A: AsRef<[u8]>>(
@@ -597,6 +641,24 @@ impl LessSafeKey {
         A: AsRef<[u8]>,
     {
         open_separate_(&self.key, nonce, aad, input, output)
+    }
+
+    /// Like [`OpeningKey::open_separate_tag()`], except it accepts an arbitrary nonce.
+    ///
+    /// `nonce` must be unique for every use of the key to open data.
+    #[inline]
+    pub fn open_separate_tag<'input, 'output, A>(
+        &mut self,
+        nonce: Nonce,
+        aad: Aad<A>,
+        input: &'input [u8],
+        output: &'output mut [u8],
+        tag: &'input [u8],
+    ) -> Result<&'output mut [u8], error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        open_separate_with_separate_tag_(&self.key, nonce, aad, input, output, tag)
     }
 
     /// Like [`OpeningKey::open_within()`], except it accepts an arbitrary nonce.
